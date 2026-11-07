@@ -15,3 +15,7 @@ monitor.log*
 *.bak
 *.tmp
 .DS_Store
+
+# Local Python test artifacts
+__pycache__/
+*.pyc

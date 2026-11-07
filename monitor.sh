@@ -2,6 +2,13 @@
 
 # Agent Application System Monitor
 set -u
+set -o pipefail
+export LC_ALL=C
+
+fail() {
+    echo "[ERROR] $*" >&2
+    exit 1
+}
 
 APP_NAME="agent-app-linux-x86"
 APP_PORT=15034
@@ -39,14 +46,24 @@ if ! sudo -n ufw status 2>/dev/null | grep -q "Status: active"; then
 fi
 
 # 4. CPU usage
-CPU=$(LC_ALL=C top -bn2 -d 0.2 | grep 'Cpu(s)' | tail -n 1 | awk '{print 100 - $8}')
-CPU=$(printf "%.1f" "$CPU")
+CPU=$(top -bn2 -d 0.2 | awk '/Cpu\(s\)/ {
+    idle = ""
+    for (i = 2; i <= NF; i++) {
+        if ($i == "id," || $i == "id") idle = $(i-1)
+    }
+} END {if (idle == "") exit 1; printf "%.1f", 100-idle}') || fail "Cannot collect CPU usage"
 
 # 5. Memory usage
-MEM=$(free | awk '/Mem:/ {printf "%.1f", ($2-$7)/$2*100}')
+MEM=$(free | awk '/Mem:/ {if ($2 <= 0 || NF < 7) exit 1; printf "%.1f", ($2-$7)/$2*100; found=1} END {if (!found) exit 1}') || fail "Cannot collect memory usage"
 
 # 6. Root disk usage
-DISK=$(df -P / | awk 'NR==2 {gsub("%","",$5); print $5}')
+DISK=$(df -P / | awk 'NR==2 {gsub("%","",$5); print $5}') || fail "Cannot collect disk usage"
+
+for VALUE in "$CPU" "$MEM" "$DISK"; do
+    [[ "$VALUE" =~ ^[0-9]+([.][0-9]+)?$ ]] || fail "Invalid resource measurement"
+    awk -v v="$VALUE" 'BEGIN {exit !(v>=0 && v<=100)}' || fail "Resource measurement out of range"
+done
+[[ "$DISK" =~ ^[0-9]+$ ]] || fail "Invalid disk usage"
 
 echo
 echo "[RESOURCE MONITORING]"
@@ -79,24 +96,25 @@ LOG_ENTRY="[$TIMESTAMP] PID:$PID CPU:$CPU% MEM:$MEM% DISK_USED:$DISK%"
 
 # 10. Log rotation (10MB per file, maximum 10 files)
 if [ -f "$LOG_FILE" ]; then
-    SIZE=$(stat -c %s "$LOG_FILE")
+    SIZE=$(stat -c %s "$LOG_FILE") || fail "Cannot read log size: $LOG_FILE"
+    [[ "$SIZE" =~ ^[0-9]+$ ]] || fail "Invalid log size: $LOG_FILE"
     ENTRY_SIZE=$(printf '%s\n' "$LOG_ENTRY" | wc -c)
 
     if [ $((SIZE + ENTRY_SIZE)) -gt "$MAX_SIZE" ]; then
-        rm -f "$LOG_FILE.$((MAX_FILES - 1))"
+        rm -f "$LOG_FILE.$((MAX_FILES - 1))" || fail "Cannot remove oldest log"
 
         for ((i=MAX_FILES-2; i>=1; i--)); do
             if [ -f "$LOG_FILE.$i" ]; then
-                mv "$LOG_FILE.$i" "$LOG_FILE.$((i+1))"
+                mv "$LOG_FILE.$i" "$LOG_FILE.$((i+1))" || fail "Cannot rotate log: $LOG_FILE.$i"
             fi
         done
 
-        mv "$LOG_FILE" "$LOG_FILE.1"
+        mv "$LOG_FILE" "$LOG_FILE.1" || fail "Cannot rotate current log"
     fi
 fi
 
 # 11. Append monitoring log
-printf '%s\n' "$LOG_ENTRY" >> "$LOG_FILE"
+printf '%s\n' "$LOG_ENTRY" >> "$LOG_FILE" || fail "Cannot append log: $LOG_FILE"
 
 echo
 echo "[INFO] Log appended: $LOG_FILE"
